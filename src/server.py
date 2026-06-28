@@ -17,6 +17,7 @@ from src.llm import LLMClient
 from src.session import SessionStore
 from src.tools.registry import ToolRegistry, ToolDef
 from src.tools.run_sql import run_sql, check_task, TOOL_DEF as SQL_TOOL_DEF, CHECK_TASK_DEF
+import src.tools.run_sql as sql_mod
 from src.tools.chart import generate_chart, TOOL_DEF as CHART_TOOL_DEF
 from src.tools.report import export_report, TOOL_DEF as REPORT_TOOL_DEF
 
@@ -135,30 +136,11 @@ def chat(sid):
     if not user_message:
         return jsonify({"error": "Empty message"}), 400
 
+    loop = None
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         response = loop.run_until_complete(runtime.run(s, user_message))
-        loop.close()
-
-        session_store.save(s)
-
-        return jsonify({
-            "reply": response.final_text,
-            "tool_traces": [
-                {
-                    "tool_name": t.tool_name,
-                    "arguments": t.arguments,
-                    "result_summary": t.result_summary,
-                    "duration_ms": t.duration_ms,
-                    "is_async": t.is_async,
-                    "task_id": t.task_id,
-                }
-                for t in response.tool_traces
-            ],
-            "turns_used": response.turns_used,
-            "context_tokens": response.context_tokens,
-        })
     except NotImplementedError:
         return jsonify({
             "error": "Runtime.run() 尚未实现！",
@@ -166,6 +148,35 @@ def chat(sid):
         }), 503
     except Exception as e:
         return jsonify({"error": str(e), "reply": f"出错了: {str(e)}"}), 500
+    finally:
+        if loop is not None:
+            # 清理 asyncpg pool（绑定到当前事件循环，loop 关闭后连接失效）
+            if sql_mod._pool is not None:
+                try:
+                    loop.run_until_complete(sql_mod._pool.close())
+                except Exception:
+                    pass
+            sql_mod._pool = None
+            loop.close()
+
+    session_store.save(s)
+
+    return jsonify({
+        "reply": response.final_text,
+        "tool_traces": [
+            {
+                "tool_name": t.tool_name,
+                "arguments": t.arguments,
+                "result_summary": t.result_summary,
+                "duration_ms": t.duration_ms,
+                "is_async": t.is_async,
+                "task_id": t.task_id,
+            }
+            for t in response.tool_traces
+        ],
+        "turns_used": response.turns_used,
+        "context_tokens": response.context_tokens,
+    })
 
 
 # ── 静态文件 ──

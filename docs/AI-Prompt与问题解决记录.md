@@ -112,6 +112,92 @@
 
 ---
 
+### 问题 7：前端会话切换失效（null 引用崩溃）
+
+**现象**：点击左侧会话列表中的另一个会话，chat 窗口内容不切换，仍显示当前会话。
+
+**根因**：`selectSession()` 函数中 `document.getElementById('empty-state').style.display = 'none'` 在 `empty-state` 元素已被 DOM 移除后抛出 `TypeError: Cannot read properties of null`。函数提前终止，`loadHistory(sid)` 从未执行。`empty-state` 元素在首次加载消息后即被 `appendMessage()` 移除。
+
+**解决**：加 null 检查 `if (emptyState) emptyState.style.display = 'none'`，`loadHistory()` 加 `await` 确保异步完成后再返回。
+
+**涉及文件**：`static/index.html`
+
+---
+
+### 问题 8：重复调用检测时机错误 → DeepSeek 400 错误
+
+**现象**：LLM 连续轮询 check_task 后，服务端日志显示 `Error code: 400 - insufficient tool messages following tool_calls message`。
+
+**根因**：重复调用检测在工具执行**之前**触发。检测到连续重复后，代码直接调 LLM 做强制总结，但 messages 列表中最后一条 assistant 消息包含 `tool_calls` 却没有对应的 `tool` 结果消息。DeepSeek API 的 message 格式校验拒绝了这个不完整的请求。
+
+**解决**：重构 Agent Loop 中的检测顺序——先执行工具、添加 tool 结果到 messages、再检测重复。这样触发强制终止时，messages 末尾的 tool_calls 已经有对应的 tool 结果，格式始终合法。同时加强错误处理，强制总结的 LLM 调用失败时返回兜底文本。
+
+**涉及文件**：`src/runtime.py`
+
+---
+
+### 问题 9：SAME_TOOL_REPEAT_LIMIT 定义但未实际使用
+
+**现象**：`check_task` 第二次连续调用就被强制终止，但代码中明明写了 `SAME_TOOL_REPEAT_LIMIT = 3`。
+
+**根因**：limit 常量定义了，但检测代码只用 `if fingerprint == last_tool_fingerprint` 判断——首次重复就触发，没有累加计数逻辑。对 `check_task` 这种需要多次轮询的工具过于激进。
+
+**解决**：新增 `same_tool_streak` 计数器。每次检测到相同指纹且结果仍为 pending 时 streak+1，仅当 `streak >= SAME_TOOL_REPEAT_LIMIT` 时才触发终止。limit 从 3 放宽到 5，给异步任务更充裕的完成窗口。
+
+**涉及文件**：`src/runtime.py`
+
+---
+
+### 问题 10：done 结果被误判为重复导致立即终止（修复引入的新 bug）
+
+**现象**：修复问题 8 后，check_task 终于返回 done，但 Agent 立即被终止，数据到了却来不及用。
+
+**根因**：修复 8 时额外加了 "非 pending 的重复调用立即终止" 逻辑（`same_tool_streak = SAME_TOOL_REPEAT_LIMIT`）。当 check_task 从 pending 变为 done —— fingerprint 相同但 result status 改变 —— 被判定为"非 pending 重复"，streak 直接到上限，瞬间终止循环。
+
+**解决**：回退为简洁逻辑——仅连续 pending 累积 streak；done、error、不同工具调用均重置 streak 为 0。done 状态的重复交给 max_turns 兜底。
+
+**涉及文件**：`src/runtime.py`
+
+---
+
+### 问题 11：多步工具链因回合预算不足提前终止
+
+**现象**：用户问"查华东 top5 商品并画柱状图"，Agent 只返回了数据库表结构描述，未执行实际查询。
+
+**根因**：`MAX_TURNS=10` 且 `ASYNC_DELAY_SECONDS=5`。每个异步 SQL 需约 6 轮（1 提交 + 5 轮询等待 5s 延迟）。LLM 先调用 `__tables__` 查看表结构耗去 7 轮，剩 3 轮给实际查询——第二个异步任务来不及等到 done 就被 max_turns 截断。
+
+**解决**：`MAX_TURNS` 从 10 上调至 20，`ASYNC_DELAY_SECONDS` 从 5s 下调至 2s。每个异步 SQL 周期降为约 4 轮，20 轮足以支持多步工具链（__tables__ + 实际查询 + 画图 + 报告）。
+
+**涉及文件**：`src/config.py`
+
+---
+
+### 问题 12：Python import 别名导致 asyncpg pool 清理失效（Event loop is closed）
+
+**现象**：重启 Server 后第一个请求成功，第二个请求报 `Event loop is closed`，第三个又正常，交替出现。
+
+**根因**：`from src.tools.run_sql import _pool as _sql_pool` 在 import 时将 `_sql_pool` 绑定到当时的**对象** `None`。之后 `_get_pool()` 通过 `global _pool` 将模块级变量重绑定为新 Pool 实例，但 server.py 中的 `_sql_pool` 仍然指向 `None`。finally 块中 `if _sql_pool is not None` 永远为 False，pool 清理从未执行。
+
+请求 1 的 pool 关闭后残留。请求 2 时 `_get_pool()` 发现 `_pool` 不是 None（是请求 1 的残留 pool），直接返回，但该 pool 的连接绑定到请求 1 的已关闭事件循环 → "Event loop is closed"。请求 2 失败后 pool 恰好在异常中被意外清理，请求 3 又能创建新 pool 正常工作。
+
+**解决**：改为 `import src.tools.run_sql as sql_mod`，在 finally 中用 `sql_mod._pool` 动态访问模块级变量的**当前值**，而非 import 时的快照。
+
+**涉及文件**：`src/server.py`
+
+---
+
+### 问题 13：环境变量手动设置繁琐
+
+**现象**：每次启动 Server 需在终端手动设置 `DEEPSEEK_API_KEY` 等环境变量，容易遗忘导致 401 认证错误。
+
+**根因**：项目未集成 .env 文件自动加载机制。
+
+**解决**：在 `config.py` 顶部添加 `load_dotenv()`，创建 `.env` 文件存储凭据，`python-dotenv` 加入 `requirements.txt`。启动时自动读取，无需手动 export。
+
+**涉及文件**：`src/config.py`、`.env`、`requirements.txt`
+
+---
+
 ## 三、Prompt 迭代心得
 
 1. **System Prompt 要约束"不要什么"，而不只是"要什么"**。初版只说了"用中文回复"，没说不允许 Markdown。加上"禁止使用 markdown 语法"后效果立竿见影。

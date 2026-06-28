@@ -21,7 +21,7 @@ from src.config import MAX_TURNS, CONTEXT_MAX_TOKENS, RECENT_FULL_ROUNDS
 
 logger = logging.getLogger("runtime")
 LLM_MAX_RETRIES = 2
-SAME_TOOL_REPEAT_LIMIT = 3
+SAME_TOOL_REPEAT_LIMIT = 5
 
 # ═══════════════════════════════════════════
 # 数据结构
@@ -99,6 +99,7 @@ class Runtime:
         traces: list[ToolTrace] = []
         turns = 0
         last_tool_fingerprint = ("", "")   # (tool_name, tool_args) 用于检测重复调用
+        same_tool_streak = 0            # 连续相同调用的次数
 
         # 1. 用户消息写入历史
         session.messages.append({"role": "user", "content": user_message})
@@ -121,7 +122,7 @@ class Runtime:
                 except RuntimeError as e:
                     logger.error("LLM 不可用，终止循环: %s", e)
                     return AgentResponse(
-                        final_text=f"抱歉，AI 服务暂时不可用，请稍后重试。",
+                        final_text=f"抱歉，AI 服务暂时不可用。原因: {e}",
                         tool_traces=traces,
                         turns_used=turns,
                     )
@@ -146,31 +147,6 @@ class Runtime:
                     tool_name = fn["name"]
                     tool_args = fn["arguments"]
 
-                    # ── 重复调用检测 ──
-                    fingerprint = (tool_name, tool_args)
-                    if fingerprint == last_tool_fingerprint:
-                        logger.warning(
-                            "检测到连续重复调用: %s(%s)，强制终止并让 LLM 总结",
-                            tool_name, tool_args[:100]
-                        )
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                f"你已经连续多次调用 {tool_name} 且参数不变。"
-                                "请基于已获取的信息直接回答用户。"
-                            )
-                        })
-                        final = await self._call_llm_with_retry(messages)
-                        session.messages.append(messages[-1])
-                        session.messages.append(final)
-                        return AgentResponse(
-                            final_text=final.get("content") or "",
-                            tool_traces=traces,
-                            turns_used=turns,
-                            context_tokens=self._estimate_tokens(messages),
-                        )
-                    last_tool_fingerprint = fingerprint
-
                     # ── 执行工具（带错处理）──
                     t0 = time.perf_counter()
                     result_str = await self._execute_tool_safely(
@@ -192,6 +168,49 @@ class Runtime:
                         result_summary=self._summarize_result(result_str),
                         duration_ms=round(elapsed_ms, 1),
                     ))
+
+                    # ── 重复调用检测（仅对 pending 结果计数）──
+                    fingerprint = (tool_name, tool_args)
+                    result_is_pending = False
+                    try:
+                        data = json.loads(result_str)
+                        result_is_pending = data.get("status") == "pending"
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+
+                    if fingerprint == last_tool_fingerprint and result_is_pending:
+                        same_tool_streak += 1
+                    else:
+                        same_tool_streak = 0
+                    last_tool_fingerprint = fingerprint
+
+                    if same_tool_streak >= SAME_TOOL_REPEAT_LIMIT:
+                        logger.warning(
+                            "连续 %s 次相同调用: %s(%s)，强制终止",
+                            same_tool_streak + 1, tool_name, tool_args[:100]
+                        )
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"你已经连续多次调用 {tool_name} 且参数不变。"
+                                "请基于已获取的信息直接回答用户，不要再调工具。"
+                            )
+                        })
+                        try:
+                            final = await self._call_llm_with_retry(messages)
+                        except RuntimeError:
+                            final = {
+                                "role": "assistant",
+                                "content": "抱歉，分析超时。请尝试重新提问。",
+                            }
+                        session.messages.append(messages[-1])
+                        session.messages.append(final)
+                        return AgentResponse(
+                            final_text=final.get("content") or "",
+                            tool_traces=traces,
+                            turns_used=turns,
+                            context_tokens=self._estimate_tokens(messages),
+                        )
 
             # 4. 达到最大轮次，强制总结
             messages.append({

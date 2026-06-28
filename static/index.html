@@ -128,8 +128,9 @@ async function selectSession(sid) {
   await refreshSessions();
   document.getElementById('msg-input').disabled = false;
   document.getElementById('send-btn').disabled = false;
-  document.getElementById('empty-state').style.display = 'none';
-  loadHistory(sid);
+  const emptyState = document.getElementById('empty-state');
+  if (emptyState) emptyState.style.display = 'none';
+  await loadHistory(sid);
 }
 
 async function newSession() {
